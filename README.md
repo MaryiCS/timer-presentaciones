@@ -22,6 +22,6 @@ Temporizador de 2 minutos para presentaciones de estudiantes. Es un solo archivo
 
 ## Uso
 
-1. Descarga `timer.html` y ábrelo en Google Chrome.
+1. Abre **https://maryics.github.io/timer-presentaciones/** en Google Chrome (o descarga `timer.html` y ábrelo).
 2. Pulsa **🔊 Probar sonido** para revisar el volumen.
 3. Abre la **ventana flotante**, arrástrala a una esquina e inicia la presentación.
