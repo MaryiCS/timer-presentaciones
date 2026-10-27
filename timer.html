@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timer de presentación</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --fg: #f5f5f5;
+    --muted: #9aa0aa;
+    --ok: #2ecc71;
+    --warn: #f5b301;
+    --danger: #ff4d4d;
+    --btn: #1d2129;
+    --btn-hover: #2a303b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 16px; transition: background .3s; }
+  body.state-done { background: #3a0d0d; }
+
+  .label { font-size: clamp(16px, 3vw, 28px); color: var(--muted); letter-spacing: .08em;
+    text-transform: uppercase; margin-bottom: 1vh; text-align: center; }
+  .time { font-variant-numeric: tabular-nums; font-weight: 800; line-height: 1;
+    font-size: min(24vw, 60vh); color: var(--ok); transition: color .3s; }
+  .state-warn .time { color: var(--warn); }
+  .state-danger .time { color: var(--danger); }
+  .state-done .time { color: #fff; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .35; } }
+
+  .bar { width: min(900px, 90vw); height: 14px; background: #262b35; border-radius: 99px;
+    overflow: hidden; margin: 3vh 0; }
+  .bar > div { height: 100%; width: 100%; background: var(--ok); transition: width .25s linear, background .3s; }
+  .state-warn .bar > div { background: var(--warn); }
+  .state-danger .bar > div, .state-done .bar > div { background: var(--danger); }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+  button { background: var(--btn); color: var(--fg); border: 1px solid #2f3542; border-radius: 12px;
+    padding: 12px 20px; font-size: 17px; cursor: pointer; white-space: nowrap; }
+  button:hover { background: var(--btn-hover); }
+  button.primary { background: var(--ok); color: #08210f; border-color: transparent; font-weight: 700; min-width: 140px; }
+  .adjust { display: flex; gap: 8px; align-items: center; margin-top: 14px; color: var(--muted); }
+  .adjust button { padding: 6px 12px; font-size: 15px; }
+  .help { margin-top: 20px; color: var(--muted); font-size: 14px; text-align: center; max-width: 720px; line-height: 1.5; }
+  .hint { margin: 12px 0 0; color: var(--warn); font-size: 15px; text-align: center; }
+  body.fullscreen .hint { display: none; }
+  kbd { background: #262b35; border-radius: 5px; padding: 1px 6px; font-family: inherit; }
+
+  /* En pantalla completa solo se ve el reloj */
+  body.fullscreen .controls, body.fullscreen .adjust, body.fullscreen .help { display: none; }
+  body.fullscreen { cursor: none; }
+</style>
+</head>
+<body>
+  <div class="label" id="label">Presentación</div>
+  <div class="time" id="time">2:00</div>
+  <div class="bar"><div id="bar"></div></div>
+
+  <div class="controls">
+    <button class="primary" id="startBtn">▶ Iniciar</button>
+    <button id="resetBtn">Reiniciar</button>
+    <button id="floatBtn">Ventana flotante</button>
+    <button id="fsBtn">Pantalla completa</button>
+    <button id="soundBtn">🔔 Sonido: sí</button>
+    <button id="testSoundBtn">🔊 Probar sonido</button>
+  </div>
+  <p class="hint" id="audioHint" hidden>🔇 El navegador está bloqueando el sonido: haz clic en cualquier parte de esta página.</p>
+
+  <div class="adjust">
+    Duración:
+    <button data-adj="-15">−15 s</button>
+    <span id="durLabel">2:00</span>
+    <button data-adj="15">+15 s</button>
+  </div>
+
+  <p class="help">
+    <b>Ventana flotante</b>: abre el reloj en una ventanita que se queda <b>encima de PowerPoint, Keynote o Google Slides</b>,
+    incluso en modo presentación. Arrástrala a una esquina y cámbiale el tamaño.<br>
+    <b>Pantalla completa</b>: úsala si el reloj va en otra pantalla o no hay diapositivas.<br>
+    Atajos: <kbd>Espacio</kbd> iniciar/pausar · <kbd>R</kbd> reiniciar · <kbd>F</kbd> pantalla completa · <kbd>P</kbd> ventana flotante
+  </p>
+
+  <!-- Respaldo para navegadores sin Document Picture-in-Picture (Safari, Firefox) -->
+  <canvas id="pipCanvas" width="480" height="270" hidden></canvas>
+  <video id="pipVideo" muted playsinline hidden></video>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const WARN_AT = 30, DANGER_AT = 10;
+
+  let duration = 120;      // segundos
+  let remainingMs = duration * 1000;
+  let endAt = null;        // performance.now() en que termina, si está corriendo
+  let soundOn = true;
+  let pipWin = null;       // ventana Document PiP
+  let firedWarn = false, firedDone = false;
+
+  const fmt = (ms) => {
+    const neg = ms < 0;
+    const s = neg ? Math.floor(-ms / 1000) : Math.ceil(ms / 1000);
+    return (neg ? "+" : "") + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  };
+
+  const stateFor = (ms) =>
+    ms <= 0 ? "done" : ms <= DANGER_AT * 1000 ? "danger" : ms <= WARN_AT * 1000 ? "warn" : "ok";
+
+  // ---- Sonido ----
+  // Notas cortas y amables: se oyen bien en parlantes de portátil, pero no interrumpen a quien presenta.
+  // Los navegadores bloquean el audio hasta que la persona hace clic o pulsa una tecla en la página,
+  // por eso se "desbloquea" con la primera interacción (en la ventana principal o en la flotante).
+  let audioCtx, master;
+  function ensureAudio() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      master = audioCtx.createGain();
+      master.gain.value = 0.9;
+      master.connect(audioCtx.destination);
+    }
+    if (audioCtx.state !== "running") audioCtx.resume().catch(() => {});
+    return audioCtx;
+  }
+  const unlockAudio = () => { if (soundOn) ensureAudio(); updateAudioHint(); };
+  for (const ev of ["pointerdown", "keydown"]) document.addEventListener(ev, unlockAudio, true);
+
+  // Una nota tipo marimba: ataque rápido y caída suave. slideTo hace un "bloop" de burbuja.
+  // Lleva una octava arriba muy suave para que se escuche aunque el parlante sea pequeño.
+  function note(freq, at, { dur = 0.35, vol = 0.25, type = "triangle", slideTo } = {}) {
+    const ctx = ensureAudio(), t = ctx.currentTime + 0.03 + at;
+    for (const [mult, v] of [[1, vol], [2, vol * 0.25]]) {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq * mult, t);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo * mult, t + 0.08);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(v, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g).connect(master);
+      o.start(t); o.stop(t + dur + 0.05);
+    }
+  }
+
+  // Aviso de 30 s: dos burbujitas "bloop-bloop"
+  function soundWarn() {
+    if (!soundOn) return;
+    note(520, 0,    { dur: 0.22, vol: 0.28, slideTo: 780 });
+    note(620, 0.18, { dur: 0.26, vol: 0.28, slideTo: 930 });
+  }
+
+  // Fin: arpegio alegre de marimba (do-mi-sol-do) con un brillito al final
+  function soundDone() {
+    if (!soundOn) return;
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) =>
+      note(f, i * 0.12, { dur: 0.5, vol: 0.3 }));
+    note(1568, 0.55, { dur: 0.7, vol: 0.12, type: "sine" });
+    note(2093, 0.63, { dur: 0.7, vol: 0.08, type: "sine" });
+  }
+
+  // Aviso visible si el navegador sigue bloqueando el audio
+  function updateAudioHint() {
+    const blocked = soundOn && audioCtx && audioCtx.state !== "running";
+    $("audioHint").hidden = !blocked;
+  }
+  setInterval(updateAudioHint, 1000);
+
+  // ---- Render ----
+  function current() { return endAt === null ? remainingMs : endAt - performance.now(); }
+
+  function render() {
+    const ms = current();
+    const text = fmt(ms);
+    const state = stateFor(ms);
+    const pct = Math.max(0, Math.min(100, (ms / (duration * 1000)) * 100));
+
+    for (const doc of [document, pipWin && pipWin.document].filter(Boolean)) {
+      const t = doc.getElementById("time");
+      if (t) t.textContent = text;
+      const b = doc.getElementById("bar");
+      if (b) b.style.width = pct + "%";
+      doc.body.classList.remove("state-ok", "state-warn", "state-danger", "state-done");
+      doc.body.classList.add("state-" + state);
+      const l = doc.getElementById("label");
+      if (l) l.textContent = state === "done" ? "¡Tu tiempo ha terminado!" : endAt === null && ms < duration * 1000 ? "En pausa" : "Presentación";
+    }
+    document.title = text + " · Timer";
+    drawCanvas(text, state, pct);
+
+    if (endAt !== null) {
+      if (!firedWarn && ms <= WARN_AT * 1000 && duration > WARN_AT) { firedWarn = true; soundWarn(); animateWarn(); }
+      if (!firedDone && ms <= 0) { firedDone = true; soundDone(); animateDone(); }
+    }
+  }
+
+  // ---- Animaciones (se dibujan en la ventana principal y en la flotante) ----
+  // Tamaños en vmin para que escalen igual en pantalla completa y en la ventanita.
+  const FX_CSS = `
+    .fx { position: fixed; pointer-events: none; z-index: 50; }
+    .fx-bubble { bottom: -12vmin; width: 14vmin; height: 14vmin; border-radius: 50%;
+      background: radial-gradient(circle at 32% 28%, rgba(255,255,255,.95) 0 7%, rgba(255,255,255,.18) 9% 30%, rgba(245,179,1,.28) 62%, rgba(245,179,1,.55) 100%);
+      box-shadow: inset 0 0 2vmin rgba(255,255,255,.35), 0 0 3vmin rgba(245,179,1,.35);
+      animation: fx-rise 1.6s cubic-bezier(.3,.6,.4,1) forwards; }
+    @keyframes fx-rise {
+      0%   { transform: translate(0, 0) scale(.6); opacity: 0; }
+      15%  { opacity: 1; }
+      40%  { transform: translate(3vmin, -40vh) scale(1); }
+      70%  { transform: translate(-3vmin, -70vh) scale(1); opacity: 1; }
+      85%  { transform: translate(0, -78vh) scale(1.25); opacity: .9; }
+      100% { transform: translate(0, -80vh) scale(1.7); opacity: 0; }
+    }
+    .fx-done { inset: 0; display: flex; align-items: center; justify-content: center; }
+    .fx-done-card { background: #fff; color: #3a0d0d; font-weight: 800; text-align: center; line-height: 1.1;
+      font-size: 9vmin; padding: 4vmin 7vmin; border-radius: 4vmin; box-shadow: 0 2vmin 6vmin rgba(0,0,0,.45);
+      animation: fx-pop 3.4s cubic-bezier(.2,1.4,.4,1) forwards; }
+    .fx-done-card span { display: block; font-size: 13vmin; animation: fx-wave .5s ease-in-out 3 alternate; }
+    @keyframes fx-pop {
+      0%   { transform: scale(.2) rotate(-8deg); opacity: 0; }
+      12%  { transform: scale(1.08) rotate(2deg); opacity: 1; }
+      20%  { transform: scale(1) rotate(0); }
+      85%  { transform: scale(1); opacity: 1; }
+      100% { transform: scale(.9) translateY(-6vmin); opacity: 0; }
+    }
+    @keyframes fx-wave { from { transform: rotate(-12deg); } to { transform: rotate(12deg); } }
+    .fx-dot { left: 50%; top: 50%; width: 2.4vmin; height: 2.4vmin; border-radius: 50%;
+      animation: fx-burst 1.4s cubic-bezier(.1,.7,.3,1) forwards; }
+    @keyframes fx-burst {
+      0%   { transform: translate(-50%, -50%) scale(.4); opacity: 1; }
+      100% { transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))) scale(1); opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) { .fx-bubble, .fx-dot { display: none; } .fx-done-card, .fx-done-card span { animation-duration: .01s; } }
+  `;
+  const styleFx = document.createElement("style");
+  styleFx.textContent = FX_CSS;
+  document.head.appendChild(styleFx);
+
+  const fxDocs = () => [document, pipWin && pipWin.document].filter(Boolean);
+
+  function spawn(doc, className, style, lifeMs) {
+    const el = doc.createElement("div");
+    el.className = "fx " + className;
+    for (const [k, v] of Object.entries(style)) k.startsWith("--") ? el.style.setProperty(k, v) : (el.style[k] = v);
+    doc.body.appendChild(el);
+    setTimeout(() => el.remove(), lifeMs);
+    return el;
+  }
+
+  // Aviso de 30 s: dos burbujas que suben y revientan, al ritmo del "bloop-bloop"
+  function animateWarn() {
+    for (const doc of fxDocs()) {
+      spawn(doc, "fx-bubble", { left: "38%" }, 1800);
+      spawn(doc, "fx-bubble", { left: "54%", animationDelay: ".16s", width: "11vmin", height: "11vmin" }, 2000);
+    }
+  }
+
+  // Fin: tarjeta "¡Tu tiempo ha terminado!" que salta, con un estallido de puntitos de colores
+  function animateDone() {
+    const colors = ["#2ecc71", "#f5b301", "#ff4d4d", "#4da3ff", "#c56cf0", "#ffffff"];
+    for (const doc of fxDocs()) {
+      const wrap = spawn(doc, "fx-done", {}, 3500);
+      wrap.innerHTML = `<div class="fx-done-card"><span>⏰</span>¡Tu tiempo<br>ha terminado!</div>`;
+      for (let i = 0; i < 22; i++) {
+        const a = (i / 22) * Math.PI * 2, r = 30 + Math.random() * 20;
+        spawn(doc, "fx-dot", {
+          background: colors[i % colors.length],
+          "--dx": Math.cos(a) * r + "vmin", "--dy": Math.sin(a) * r + "vmin",
+          animationDelay: 0.1 + Math.random() * 0.15 + "s",
+        }, 1800);
+      }
+    }
+  }
+
+  function clearFx() { for (const doc of fxDocs()) doc.querySelectorAll(".fx").forEach((el) => el.remove()); }
+
+  function loop() { render(); if (endAt !== null) requestAnimationFrame(loop); }
+  // rAF se detiene si la pestaña queda oculta (p. ej. tras abrir la presentación); este intervalo lo cubre
+  setInterval(() => { if (endAt !== null) render(); }, 250);
+
+  // ---- Controles ----
+  function toggle() {
+    if (endAt === null) {
+      if (soundOn) ensureAudio(); // el navegador solo permite audio tras un clic
+      endAt = performance.now() + remainingMs;
+      $("startBtn").textContent = "⏸ Pausar";
+      loop();
+    } else {
+      remainingMs = endAt - performance.now();
+      endAt = null;
+      $("startBtn").textContent = "▶ Continuar";
+      render();
+    }
+  }
+
+  function reset() {
+    endAt = null;
+    remainingMs = duration * 1000;
+    firedWarn = firedDone = false;
+    clearFx();
+    $("startBtn").textContent = "▶ Iniciar";
+    render();
+  }
+
+  function adjust(delta) {
+    duration = Math.max(15, Math.min(60 * 60, duration + delta));
+    $("durLabel").textContent = fmt(duration * 1000);
+    reset();
+  }
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else {
+      const el = document.documentElement;
+      (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+    }
+  }
+  const onFsChange = () => document.body.classList.toggle("fullscreen",
+    !!(document.fullscreenElement || document.webkitFullscreenElement));
+  document.addEventListener("fullscreenchange", onFsChange);
+  document.addEventListener("webkitfullscreenchange", onFsChange);
+
+  // ---- Ventana flotante (siempre encima) ----
+  async function openFloating() {
+    if (pipWin) { pipWin.close(); return; }
+    if ("documentPictureInPicture" in window) {
+      pipWin = await documentPictureInPicture.requestWindow({ width: 360, height: 220 });
+      pipWin.document.head.innerHTML = `
+        <style>
+          html,body{margin:0;height:100%;background:#0f1115;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+            display:flex;flex-direction:column;align-items:center;justify-content:center;transition:background .3s;user-select:none}
+          body.state-done{background:#3a0d0d}
+          #label{font-size:4.5vw;color:#9aa0aa;text-transform:uppercase;letter-spacing:.08em}
+          #time{font-weight:800;font-variant-numeric:tabular-nums;line-height:1;font-size:min(42vw,62vh);color:#2ecc71;cursor:pointer}
+          .state-warn #time{color:#f5b301}.state-danger #time{color:#ff4d4d}
+          .state-done #time{color:#fff;animation:b 1s steps(2) infinite}@keyframes b{50%{opacity:.35}}
+          ${FX_CSS}
+          .bar{width:86%;height:6px;background:#262b35;border-radius:9px;overflow:hidden;margin-top:4vh}
+          #bar{height:100%;background:#2ecc71}.state-warn #bar{background:#f5b301}.state-danger #bar,.state-done #bar{background:#ff4d4d}
+        </style>`;
+      pipWin.document.body.innerHTML =
+        `<div id="label"></div><div id="time" title="Clic: iniciar/pausar"></div><div class="bar"><div id="bar"></div></div>`;
+      pipWin.document.getElementById("time").addEventListener("click", toggle);
+      pipWin.document.addEventListener("keydown", onKey);
+      for (const ev of ["pointerdown", "keydown"]) pipWin.document.addEventListener(ev, unlockAudio, true);
+      pipWin.addEventListener("pagehide", () => { pipWin = null; $("floatBtn").textContent = "Ventana flotante"; });
+      $("floatBtn").textContent = "Cerrar flotante";
+      render();
+    } else {
+      // Respaldo: video PiP alimentado por un canvas
+      const v = $("pipVideo");
+      if (document.pictureInPictureElement) { await document.exitPictureInPicture(); return; }
+      if (!v.srcObject) v.srcObject = $("pipCanvas").captureStream(10);
+      drawCanvas(fmt(current()), stateFor(current()), 100);
+      await v.play();
+      await v.requestPictureInPicture();
+    }
+  }
+
+  const COLORS = { ok: "#2ecc71", warn: "#f5b301", danger: "#ff4d4d", done: "#ffffff" };
+  function drawCanvas(text, state, pct) {
+    const c = $("pipCanvas"), ctx = c.getContext("2d");
+    ctx.fillStyle = state === "done" ? "#3a0d0d" : "#0f1115";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.fillStyle = COLORS[state];
+    ctx.font = "800 150px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(text, c.width / 2, c.height / 2 - 10);
+    ctx.fillStyle = "#262b35"; ctx.fillRect(40, 230, 400, 10);
+    ctx.fillStyle = state === "ok" ? COLORS.ok : state === "warn" ? COLORS.warn : COLORS.danger;
+    ctx.fillRect(40, 230, 400 * pct / 100, 10);
+  }
+
+  // ---- Eventos ----
+  $("startBtn").onclick = toggle;
+  $("resetBtn").onclick = reset;
+  $("fsBtn").onclick = toggleFullscreen;
+  $("floatBtn").onclick = () => openFloating().catch((e) => alert("No se pudo abrir la ventana flotante: " + e.message));
+  $("soundBtn").onclick = () => { soundOn = !soundOn; $("soundBtn").textContent = "🔔 Sonido: " + (soundOn ? "sí" : "no"); updateAudioHint(); };
+  $("testSoundBtn").onclick = () => { if (!soundOn) $("soundBtn").click(); soundWarn(); setTimeout(soundDone, 900); };
+  document.querySelectorAll("[data-adj]").forEach((b) => b.onclick = () => adjust(+b.dataset.adj));
+  $("time").onclick = toggle;
+
+  function onKey(e) {
+    if (e.code === "Space") { e.preventDefault(); toggle(); }
+    else if (e.key === "r" || e.key === "R") reset();
+    else if (e.key === "f" || e.key === "F") toggleFullscreen();
+    else if (e.key === "p" || e.key === "P") openFloating().catch(() => {});
+  }
+  document.addEventListener("keydown", onKey);
+
+  render();
+</script>
+</body>
+</html>
